@@ -222,6 +222,9 @@ void EpubReaderActivity::onExit() {
   if (footnoteDepth > 0 && epub) {
     const SavedPosition& origin = savedPositions[0];
     saveProgress(origin.spineIndex, origin.pageNumber, 0);
+  } else if (epub && section) {
+    // Per-turn saves are debounced; flush the latest position on the way out.
+    saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
   }
 
   section.reset();
@@ -807,8 +810,9 @@ void EpubReaderActivity::computeContentMargins(int& top, int& right, int& bottom
   // reserves space for automatic page turn indicator when no status bar or progress bar only
   if (automaticPageTurnActive &&
       (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
-    bottom += std::max(SETTINGS.screenMargin, static_cast<uint8_t>(statusBarHeight +
-                                                                   UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+    bottom +=
+        std::max(SETTINGS.screenMargin,
+                 static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
   } else {
     bottom += std::max(SETTINGS.screenMargin, statusBarHeight);
   }
@@ -994,7 +998,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
-  saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
+  maybeSaveProgress();
 
   showPendingSyncSaveError();
 
@@ -1048,6 +1052,22 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
 
 bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
   return EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount);
+}
+
+// Debounced per-page-turn progress save (see PROGRESS_SAVE_INTERVAL). Chapter
+// changes save immediately; onExit() flushes the latest position, so at most
+// the last few in-chapter turns are lost on a hard power cut.
+void EpubReaderActivity::maybeSaveProgress() {
+  if (!section) {
+    return;
+  }
+  turnsSinceProgressSave++;
+  if (currentSpineIndex != lastSavedSpineIndex || turnsSinceProgressSave >= PROGRESS_SAVE_INTERVAL) {
+    if (saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
+      turnsSinceProgressSave = 0;
+      lastSavedSpineIndex = currentSpineIndex;
+    }
+  }
 }
 
 // Idle-time speculation: pre-render the next page into the framebuffer so a
@@ -1133,7 +1153,7 @@ void EpubReaderActivity::consumeSpeculativeFrame(const int orientedMarginTop, co
     }
   }
 
-  saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
+  maybeSaveProgress();
 
   if (pendingSyncSaveError) {
     pendingSyncSaveError = false;

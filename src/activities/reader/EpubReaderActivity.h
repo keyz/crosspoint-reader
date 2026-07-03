@@ -49,6 +49,13 @@ class EpubReaderActivity final : public Activity {
   // Consumed in onExit() to relocate the finished book into /Read/.
   bool pendingReadFolderMove = false;
 
+  // Progress-save debounce: progress.bin is written every Nth page turn or on
+  // a chapter change instead of on every turn (SD sectors have a finite erase
+  // cycle limit), and flushed unconditionally in onExit().
+  static constexpr uint8_t PROGRESS_SAVE_INTERVAL = 5;
+  uint8_t turnsSinceProgressSave = 0;
+  int lastSavedSpineIndex = -1;
+
   // Speculative next-page pre-render: after a page is displayed, the NEXT page
   // is drawn into the framebuffer during idle time so a forward turn only pays
   // the e-ink refresh. While parked, the framebuffer no longer matches the
@@ -84,6 +91,7 @@ class EpubReaderActivity final : public Activity {
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
+  void maybeSaveProgress();
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
