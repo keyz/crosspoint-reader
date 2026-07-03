@@ -785,6 +785,7 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
     }
   }
   lastPageTurnTime = millis();
+  turnRequestedAt = lastPageTurnTime;
   requestUpdate();
 }
 
@@ -1070,6 +1071,10 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
   const auto tDisplay = millis();
+  if (turnRequestedAt != 0) {
+    LOG_INF("ERS", "Turn-to-visible: %lums (full)", tDisplay - turnRequestedAt);
+    turnRequestedAt = 0;
+  }
 
   // Tiled grayscale: render each plane band-by-band into a small scratch and
   // stream straight to the controller, leaving the BW framebuffer intact so no
