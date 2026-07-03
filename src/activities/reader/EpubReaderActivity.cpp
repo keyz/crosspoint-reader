@@ -206,6 +206,11 @@ void EpubReaderActivity::onEnter() {
 void EpubReaderActivity::onExit() {
   Activity::onExit();
 
+  // Repaint the current page over any parked speculative frame before anything
+  // downstream (sleep screen, quick resume) snapshots or draws over the
+  // framebuffer. Must run while the reader orientation is still applied.
+  restoreFramebufferAfterSpeculation();
+
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
 
@@ -789,6 +794,26 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   requestUpdate();
 }
 
+// Content margins for the reader viewport: physical bezel plus user margin,
+// with the bottom reserving space for the status bar / auto-turn indicator.
+void EpubReaderActivity::computeContentMargins(int& top, int& right, int& bottom, int& left) const {
+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+  top += SETTINGS.screenMargin;
+  left += SETTINGS.screenMargin;
+  right += SETTINGS.screenMargin;
+
+  const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
+
+  // reserves space for automatic page turn indicator when no status bar or progress bar only
+  if (automaticPageTurnActive &&
+      (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
+    bottom += std::max(SETTINGS.screenMargin, static_cast<uint8_t>(statusBarHeight +
+                                                                   UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+  } else {
+    bottom += std::max(SETTINGS.screenMargin, statusBarHeight);
+  }
+}
+
 // TODO: Failure handling
 void EpubReaderActivity::render(RenderLock&& lock) {
   if (!epub) {
@@ -813,6 +838,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   // Show end of book screen
   if (currentSpineIndex == epub->getSpineItemsCount()) {
     renderer.clearScreen();
+    frameIsSpeculative = false;  // full repaint: framebuffer mirrors the panel again
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_END_OF_BOOK), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();
     automaticPageTurnActive = false;
@@ -822,26 +848,23 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
   // Apply screen viewable areas and additional padding
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
-  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
-                                   &orientedMarginLeft);
-  orientedMarginTop += SETTINGS.screenMargin;
-  orientedMarginLeft += SETTINGS.screenMargin;
-  orientedMarginRight += SETTINGS.screenMargin;
-
-  const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
-
-  // reserves space for automatic page turn indicator when no status bar or progress bar only
-  if (automaticPageTurnActive &&
-      (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
-    orientedMarginBottom +=
-        std::max(SETTINGS.screenMargin,
-                 static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
-  } else {
-    orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
-  }
+  computeContentMargins(orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
 
   const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
   const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
+
+  // Fast path: the framebuffer already holds a speculative pre-render of the
+  // page being requested — only the status bar and the e-ink refresh remain.
+  // The token is single-shot: on any mismatch (backward turn, jump, chapter
+  // change, section rebuild) it is discarded and the normal path below
+  // repaints the framebuffer from scratch.
+  if (speculationValid) {
+    speculationValid = false;
+    if (section && currentSpineIndex == specSpineIndex && section->currentPage == specPageNumber) {
+      consumeSpeculativeFrame(orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
+      return;
+    }
+  }
 
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
@@ -854,6 +877,12 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                                   SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
       LOG_DBG("ERS", "Cache not found, building...");
 
+      if (frameIsSpeculative) {
+        // The framebuffer holds a speculative next page, not what is on
+        // screen; don't let the popup display it as the background.
+        renderer.clearScreen();
+        frameIsSpeculative = false;
+      }
       GUI.drawPopup(renderer, tr(STR_INDEXING));
 
       const auto popupFn = [this]() { GUI.drawPopup(renderer, tr(STR_INDEXING)); };
@@ -921,6 +950,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   }
 
   renderer.clearScreen();
+  frameIsSpeculative = false;  // full repaint: every path below displays this frame
 
   if (section->pageCount == 0) {
     LOG_DBG("ERS", "No pages to render");
@@ -964,7 +994,6 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
-  silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
 
   showPendingSyncSaveError();
@@ -977,6 +1006,12 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   if (showBookmarkMessage) {
     GUI.drawPopup(renderer, bookmarkRemoved ? tr(STR_BOOKMARK_REMOVED) : tr(STR_BOOKMARK_ADDED));
   }
+
+  // Idle-time work, ordered after everything above has read or drawn over the
+  // displayed frame: pre-render the next page for a fast turn, then pre-index
+  // the next chapter if the end of this one is near.
+  speculativeRenderNextPage(orientedMarginLeft, orientedMarginTop);
+  silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
 }
 
 void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
@@ -1013,6 +1048,136 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
 
 bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
   return EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount);
+}
+
+// Idle-time speculation: pre-render the next page into the framebuffer so a
+// forward turn only pays the e-ink refresh. Safe in single-buffer mode because
+// displayBuffer() re-syncs the controller's own copy of the shown frame before
+// returning, leaving the framebuffer free. From here until the next display
+// (or restoreFramebufferAfterSpeculation) the framebuffer no longer matches
+// the screen.
+void EpubReaderActivity::speculativeRenderNextPage(const int orientedMarginLeft, const int orientedMarginTop) {
+  speculationValid = false;
+  if (!epub || !section || section->pageCount <= 0) {
+    return;
+  }
+  // Snapshot once: the main task's pageTurn() may bump currentPage while this
+  // runs (it takes no render lock). If the turn lands before the snapshot we
+  // pre-render the newly requested page and the queued render consumes it; if
+  // after, the token mismatches and the next render discards the frame. Both
+  // interleavings are correct.
+  const int specPage = section->currentPage + 1;
+  if (specPage >= section->pageCount) {
+    return;  // last page: the chapter-boundary turn falls back to the normal path
+  }
+
+  const auto t0 = millis();
+  auto page = section->loadPageFromSectionFile(specPage);
+  if (!page) {
+    return;  // framebuffer untouched; the next turn takes the normal path
+  }
+  if (page->hasImages()) {
+    return;  // image pages need the blank/double-refresh dance in renderContents()
+  }
+
+  frameIsSpeculative = true;
+  renderer.clearScreen();
+
+  const int fontId = SETTINGS.getReaderFontId();
+  auto* fcm = renderer.getFontCacheManager();
+  auto scope = fcm->createPrewarmScope();
+  page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);  // scan pass
+  scope.endScanAndPrewarm();
+  page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+  // Status bar intentionally not drawn: clock/battery would go stale while the
+  // frame is parked; it is drawn fresh at consume time.
+
+  speculativeFootnotes = std::move(page->footnotes);
+  specSpineIndex = currentSpineIndex;
+  specPageNumber = specPage;
+  speculationValid = true;
+  LOG_DBG("ERS", "Speculative render of page %d in %lums (heap %u)", specPage, millis() - t0,
+          static_cast<unsigned>(ESP.getFreeHeap()));
+}
+
+// Fast page-turn path: the framebuffer already holds this page. Draw the
+// status bar, refresh, then run the same post-display tail as the normal path.
+void EpubReaderActivity::consumeSpeculativeFrame(const int orientedMarginTop, const int orientedMarginRight,
+                                                 const int orientedMarginBottom, const int orientedMarginLeft) {
+  updateBookmarkFlag();
+  currentPageFootnotes = std::move(speculativeFootnotes);
+  speculativeFootnotes.clear();
+
+  // The speculative frame is content-only; the status bar band was left white
+  // by its clearScreen. Draw the bar now so clock, battery, and bookmark state
+  // are current at display time.
+  renderStatusBar();
+
+  ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+  frameIsSpeculative = false;
+  if (turnRequestedAt != 0) {
+    LOG_INF("ERS", "Turn-to-visible: %lums (speculative)", millis() - turnRequestedAt);
+    turnRequestedAt = 0;
+  }
+
+  // Grayscale AA cannot be pre-staged: until the refresh above, the controller
+  // RAM still holds the previous page's differential baseline. Run it now that
+  // the BW frame is visible — the same ordering as the normal path. Image
+  // pages never reach this path (speculation skips them).
+  if (SETTINGS.textAntiAliasing) {
+    auto page = section->loadPageFromSectionFile();
+    if (page) {
+      renderGrayscalePasses(*page, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, false);
+    } else {
+      LOG_ERR("ERS", "Failed to reload page for grayscale pass; BW frame remains");
+    }
+  }
+
+  saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
+
+  if (pendingSyncSaveError) {
+    pendingSyncSaveError = false;
+    GUI.drawPopup(renderer, tr(STR_SAVE_PROGRESS_FAILED));
+  }
+  if (pendingScreenshot) {
+    pendingScreenshot = false;
+    ScreenshotUtil::takeScreenshot(renderer);
+  }
+  if (showBookmarkMessage) {
+    GUI.drawPopup(renderer, bookmarkRemoved ? tr(STR_BOOKMARK_REMOVED) : tr(STR_BOOKMARK_ADDED));
+  }
+
+  speculativeRenderNextPage(orientedMarginLeft, orientedMarginTop);
+  const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
+  const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
+  silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
+}
+
+// The reader normally leaves the framebuffer mirroring the panel, and
+// downstream consumers rely on that: SleepActivity's quick-resume mode and its
+// "entering sleep" popup draw over the inherited framebuffer, and quick resume
+// persists it for restore-on-wake. If a speculative next page is parked there,
+// repaint the current page (no display needed — the panel already shows it).
+// Caller must hold the render lock; ActivityManager::exitActivity() does.
+void EpubReaderActivity::restoreFramebufferAfterSpeculation() {
+  if (!frameIsSpeculative) {
+    return;
+  }
+  frameIsSpeculative = false;
+  speculationValid = false;
+
+  std::unique_ptr<Page> page;
+  if (epub && section) {
+    page = section->loadPageFromSectionFile();
+  }
+  renderer.clearScreen();
+  if (!page) {
+    return;  // a blank frame beats a wrong page
+  }
+  int top, right, bottom, left;
+  computeContentMargins(top, right, bottom, left);
+  page->render(renderer, SETTINGS.getReaderFontId(), left, top);
+  renderStatusBar();
 }
 void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,

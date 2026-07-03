@@ -49,6 +49,20 @@ class EpubReaderActivity final : public Activity {
   // Consumed in onExit() to relocate the finished book into /Read/.
   bool pendingReadFolderMove = false;
 
+  // Speculative next-page pre-render: after a page is displayed, the NEXT page
+  // is drawn into the framebuffer during idle time so a forward turn only pays
+  // the e-ink refresh. While parked, the framebuffer no longer matches the
+  // screen; frameIsSpeculative guards the few paths that draw over the
+  // framebuffer assuming it mirrors the panel. The {spine, page} token is
+  // single-shot: the next render() either consumes it or discards it.
+  bool speculationValid = false;
+  bool frameIsSpeculative = false;
+  int specSpineIndex = -1;
+  int specPageNumber = -1;
+  // Footnotes captured from the speculative page, moved into
+  // currentPageFootnotes at consume time (bounded by MAX_FOOTNOTES_PER_PAGE).
+  std::vector<FootnoteEntry> speculativeFootnotes;
+
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
   struct SavedPosition {
@@ -62,6 +76,11 @@ class EpubReaderActivity final : public Activity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderGrayscalePasses(const Page& page, int fontId, int marginLeft, int marginTop, bool pageHasImages);
+  void computeContentMargins(int& top, int& right, int& bottom, int& left) const;
+  void speculativeRenderNextPage(int orientedMarginLeft, int orientedMarginTop);
+  void consumeSpeculativeFrame(int orientedMarginTop, int orientedMarginRight, int orientedMarginBottom,
+                               int orientedMarginLeft);
+  void restoreFramebufferAfterSpeculation();
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
