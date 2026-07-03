@@ -40,6 +40,10 @@ class Section {
                          uint8_t imageRendering, bool focusReadingEnabled,
                          const std::function<void()>& popupFn = nullptr);
   std::unique_ptr<Page> loadPageFromSectionFile();
+  // Load an arbitrary page without touching currentPage. Used by speculative
+  // pre-rendering, which must not mutate currentPage: the main task's page-turn
+  // handler increments it concurrently without taking the render lock.
+  std::unique_ptr<Page> loadPageFromSectionFile(int pageNumber);
   std::string getTextFromSectionFile();
 
   // Look up the page number for an anchor id from the section cache file.
