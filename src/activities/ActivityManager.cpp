@@ -248,6 +248,13 @@ void ActivityManager::popActivity() {
   pendingAction = PendingAction::Pop;
 }
 
+void ActivityManager::ensureFramebufferMatchesPanel() const {
+  // Note: caller must hold a RenderLock (like exitActivity)
+  if (currentActivity) {
+    currentActivity->ensureFramebufferMatchesPanel();
+  }
+}
+
 bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
 
 bool ActivityManager::isReaderActivity() const {

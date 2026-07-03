@@ -41,6 +41,13 @@ class Activity {
   // Request an immediate render and block until it completes.
   virtual void requestUpdateAndWait();
 
+  // Called (with the render lock held) before something outside the activity
+  // consumes the framebuffer directly — screenshots, forced panel refreshes.
+  // Activities that let the framebuffer diverge from the panel (e.g. a reader
+  // parking a speculatively pre-rendered next page) must repaint the currently
+  // displayed content here. Default: framebuffer already mirrors the panel.
+  virtual void ensureFramebufferMatchesPanel() {}
+
   virtual bool skipLoopDelay() { return false; }
   virtual bool preventAutoSleep() { return false; }
   virtual bool isReaderActivity() const { return false; }

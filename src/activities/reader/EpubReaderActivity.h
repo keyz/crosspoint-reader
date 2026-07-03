@@ -64,6 +64,9 @@ class EpubReaderActivity final : public Activity {
   // single-shot: the next render() either consumes it or discards it.
   bool speculationValid = false;
   bool frameIsSpeculative = false;
+  // Skip speculation while the user pages backward — the forward guess would
+  // be discarded every turn and its cost would delay each backward render.
+  bool lastTurnWasBackward = false;
   int specSpineIndex = -1;
   int specPageNumber = -1;
   // Footnotes captured from the speculative page, moved into
@@ -92,6 +95,9 @@ class EpubReaderActivity final : public Activity {
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   void maybeSaveProgress();
+  void showPendingSyncSaveErrorPopup();
+  void postDisplayTail(int orientedMarginTop, int orientedMarginRight, int orientedMarginBottom,
+                       int orientedMarginLeft);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
@@ -116,6 +122,7 @@ class EpubReaderActivity final : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&& lock) override;
+  void ensureFramebufferMatchesPanel() override { restoreFramebufferAfterSpeculation(); }
   bool isReaderActivity() const override { return true; }
   ScreenshotInfo getScreenshotInfo() const override;
   CrossPointPosition getCurrentPosition() const;

@@ -792,6 +792,7 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
       }
     }
   }
+  lastTurnWasBackward = !isForwardTurn;
   lastPageTurnTime = millis();
   turnRequestedAt = lastPageTurnTime;
   requestUpdate();
@@ -824,12 +825,6 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
-  const auto showPendingSyncSaveError = [this]() {
-    if (!pendingSyncSaveError) return;
-    pendingSyncSaveError = false;
-    GUI.drawPopup(renderer, tr(STR_SAVE_PROGRESS_FAILED));
-  };
-
   // edge case handling for sub-zero spine index
   if (currentSpineIndex < 0) {
     currentSpineIndex = 0;
@@ -846,7 +841,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_END_OF_BOOK), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();
     automaticPageTurnActive = false;
-    showPendingSyncSaveError();
+    showPendingSyncSaveErrorPopup();
     return;
   }
 
@@ -868,6 +863,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       consumeSpeculativeFrame(orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
       return;
     }
+    speculativeFootnotes = {};  // discarded: release the parked footnotes
   }
 
   if (!section) {
@@ -897,7 +893,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                                       SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
         LOG_ERR("ERS", "Failed to persist page data to SD");
         section.reset();
-        showPendingSyncSaveError();
+        showPendingSyncSaveErrorPopup();
         return;
       }
     } else {
@@ -962,7 +958,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderStatusBar();
     renderer.displayBuffer();
     automaticPageTurnActive = false;
-    showPendingSyncSaveError();
+    showPendingSyncSaveErrorPopup();
     return;
   }
 
@@ -972,7 +968,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderStatusBar();
     renderer.displayBuffer();
     automaticPageTurnActive = false;
-    showPendingSyncSaveError();
+    showPendingSyncSaveErrorPopup();
     return;
   }
 
@@ -987,7 +983,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       requestUpdate();  // Try again after clearing cache
                         // TODO: prevent infinite loop if the page keeps failing to load for some reason
       automaticPageTurnActive = false;
-      showPendingSyncSaveError();
+      showPendingSyncSaveErrorPopup();
       return;
     }
 
@@ -998,9 +994,24 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
+  postDisplayTail(orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
+}
+
+void EpubReaderActivity::showPendingSyncSaveErrorPopup() {
+  if (!pendingSyncSaveError) return;
+  pendingSyncSaveError = false;
+  GUI.drawPopup(renderer, tr(STR_SAVE_PROGRESS_FAILED));
+}
+
+// Shared tail of the normal and speculative-consume render paths, run after
+// the page is displayed: persist progress, surface pending popups and the
+// screenshot, then do the idle-time work (next-page speculation, next-chapter
+// indexing) after everything above has read or drawn over the displayed frame.
+void EpubReaderActivity::postDisplayTail(const int orientedMarginTop, const int orientedMarginRight,
+                                         const int orientedMarginBottom, const int orientedMarginLeft) {
   maybeSaveProgress();
 
-  showPendingSyncSaveError();
+  showPendingSyncSaveErrorPopup();
 
   if (pendingScreenshot) {
     pendingScreenshot = false;
@@ -1011,10 +1022,9 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     GUI.drawPopup(renderer, bookmarkRemoved ? tr(STR_BOOKMARK_REMOVED) : tr(STR_BOOKMARK_ADDED));
   }
 
-  // Idle-time work, ordered after everything above has read or drawn over the
-  // displayed frame: pre-render the next page for a fast turn, then pre-index
-  // the next chapter if the end of this one is near.
   speculativeRenderNextPage(orientedMarginLeft, orientedMarginTop);
+  const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
+  const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
 }
 
@@ -1081,6 +1091,11 @@ void EpubReaderActivity::speculativeRenderNextPage(const int orientedMarginLeft,
   if (!epub || !section || section->pageCount <= 0) {
     return;
   }
+  if (lastTurnWasBackward) {
+    // Paging backward: the next-forward-page guess would be discarded on every
+    // turn, and the discarded work would delay each successive backward render.
+    return;
+  }
   // Snapshot once: the main task's pageTurn() may bump currentPage while this
   // runs (it takes no render lock). If the turn lands before the snapshot we
   // pre-render the newly requested page and the queued render consumes it; if
@@ -1145,32 +1160,25 @@ void EpubReaderActivity::consumeSpeculativeFrame(const int orientedMarginTop, co
   // the BW frame is visible — the same ordering as the normal path. Image
   // pages never reach this path (speculation skips them).
   if (SETTINGS.textAntiAliasing) {
-    auto page = section->loadPageFromSectionFile();
+    // Reload by the consumed token, not the live currentPage: the main task
+    // may already have queued another turn (pageTurn takes no render lock),
+    // and the overlay must match the BW frame just displayed.
+    auto page = section->loadPageFromSectionFile(specPageNumber);
     if (page) {
-      renderGrayscalePasses(*page, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, false);
+      const int fontId = SETTINGS.getReaderFontId();
+      // The speculative render's prewarm scope cleared the glyph cache when it
+      // ended; renderGrayscalePasses re-renders the page strip-by-strip, so
+      // prewarm again or every strip decodes its glyphs cold.
+      auto scope = renderer.getFontCacheManager()->createPrewarmScope();
+      page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);  // scan pass, no drawing
+      scope.endScanAndPrewarm();
+      renderGrayscalePasses(*page, fontId, orientedMarginLeft, orientedMarginTop, false);
     } else {
       LOG_ERR("ERS", "Failed to reload page for grayscale pass; BW frame remains");
     }
   }
 
-  maybeSaveProgress();
-
-  if (pendingSyncSaveError) {
-    pendingSyncSaveError = false;
-    GUI.drawPopup(renderer, tr(STR_SAVE_PROGRESS_FAILED));
-  }
-  if (pendingScreenshot) {
-    pendingScreenshot = false;
-    ScreenshotUtil::takeScreenshot(renderer);
-  }
-  if (showBookmarkMessage) {
-    GUI.drawPopup(renderer, bookmarkRemoved ? tr(STR_BOOKMARK_REMOVED) : tr(STR_BOOKMARK_ADDED));
-  }
-
-  speculativeRenderNextPage(orientedMarginLeft, orientedMarginTop);
-  const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
-  const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
-  silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
+  postDisplayTail(orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
 }
 
 // The reader normally leaves the framebuffer mirroring the panel, and
@@ -1185,6 +1193,7 @@ void EpubReaderActivity::restoreFramebufferAfterSpeculation() {
   }
   frameIsSpeculative = false;
   speculationValid = false;
+  speculativeFootnotes = {};
 
   std::unique_ptr<Page> page;
   if (epub && section) {

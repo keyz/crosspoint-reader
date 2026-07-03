@@ -504,6 +504,8 @@ void loop() {
       String cmd = line.substring(4);
       cmd.trim();
       if (cmd == "SCREENSHOT") {
+        RenderLock lock;
+        activityManager.ensureFramebufferMatchesPanel();
         const uint32_t bufferSize = display.getBufferSize();
         logSerial.printf("SCREENSHOT_START:%d\n", bufferSize);
         uint8_t* buf = display.getFrameBuffer();
@@ -529,6 +531,7 @@ void loop() {
       screenshotButtonsReleased = false;
       {
         RenderLock lock;
+        activityManager.ensureFramebufferMatchesPanel();
         ScreenshotUtil::takeScreenshot(renderer);
       }
     }
@@ -569,6 +572,7 @@ void loop() {
       mappedInputManager.wasReleased(MappedInputManager::Button::Power)) {
     LOG_DBG("MAIN", "Manual screen refresh triggered");
     RenderLock lock;
+    activityManager.ensureFramebufferMatchesPanel();
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
   }
 

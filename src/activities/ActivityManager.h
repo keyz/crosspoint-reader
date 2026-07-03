@@ -100,6 +100,11 @@ class ActivityManager {
   // Note: if popActivity() on last activity on the stack, we will goHome()
   void popActivity();
 
+  // Ask the current activity to repaint the framebuffer if it has let it
+  // diverge from the panel (see Activity::ensureFramebufferMatchesPanel).
+  // Caller must hold a RenderLock.
+  void ensureFramebufferMatchesPanel() const;
+
   bool preventAutoSleep() const;
   bool isReaderActivity() const;
   bool skipLoopDelay() const;
