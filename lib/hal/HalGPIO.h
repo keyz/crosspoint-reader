@@ -69,6 +69,7 @@ class HalGPIO {
   bool wasAnyPressed() const;
   bool wasReleased(uint8_t buttonIndex) const;
   bool wasAnyReleased() const;
+  bool isDebouncePending() const;
   unsigned long getHeldTime() const;
   unsigned long getPowerButtonHeldTime() const;
 
